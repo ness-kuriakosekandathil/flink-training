@@ -21,6 +21,8 @@ package org.apache.flink.training.exercises.longrides;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -28,6 +30,7 @@ import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.streaming.api.functions.sink.PrintSinkFunction;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.training.exercises.common.datatypes.TaxiFare;
 import org.apache.flink.training.exercises.common.datatypes.TaxiRide;
 import org.apache.flink.training.exercises.common.sources.TaxiRideGenerator;
 import org.apache.flink.training.exercises.common.utils.MissingSolutionException;
@@ -47,7 +50,9 @@ public class LongRidesExercise {
     private final SourceFunction<TaxiRide> source;
     private final SinkFunction<Long> sink;
 
-    /** Creates a job using the source and sink provided. */
+    /**
+     * Creates a job using the source and sink provided.
+     */
     public LongRidesExercise(SourceFunction<TaxiRide> source, SinkFunction<Long> sink) {
         this.source = source;
         this.sink = sink;
@@ -74,11 +79,11 @@ public class LongRidesExercise {
                                 (ride, streamRecordTimestamp) -> ride.getEventTimeMillis());
 
         // create the pipeline
-        rides.assignTimestampsAndWatermarks(watermarkStrategy)
+        DataStream<Long> longRides = rides.assignTimestampsAndWatermarks(watermarkStrategy)
                 .keyBy(ride -> ride.rideId)
-                .process(new AlertFunction())
-                .addSink(sink);
-
+                .process(new AlertFunction());
+        longRides.print();
+        longRides.addSink(sink);
         // execute the pipeline and return the result
         return env.execute("Long Taxi Rides");
     }
@@ -91,24 +96,61 @@ public class LongRidesExercise {
     public static void main(String[] args) throws Exception {
         LongRidesExercise job =
                 new LongRidesExercise(new TaxiRideGenerator(), new PrintSinkFunction<>());
-
         job.execute();
     }
 
     @VisibleForTesting
     public static class AlertFunction extends KeyedProcessFunction<Long, TaxiRide, Long> {
 
+        private ValueState<TaxiRide> startState;
+        private ValueState<TaxiRide> endState;
+
         @Override
         public void open(Configuration config) throws Exception {
-            throw new MissingSolutionException();
+            startState = getRuntimeContext().getState(new ValueStateDescriptor<>("startState", TaxiRide.class));
+            endState = getRuntimeContext().getState(new ValueStateDescriptor<>("endState", TaxiRide.class));
         }
 
         @Override
         public void processElement(TaxiRide ride, Context context, Collector<Long> out)
-                throws Exception {}
+                throws Exception {
+            Long duration = null;
+            if (ride.isStart) {
+                startState.update(ride);
+                if (endState != null && endState.value() != null) {
+                    duration = (endState.value().getEventTimeMillis() - startState.value().getEventTimeMillis());
+                    context.timerService().deleteEventTimeTimer(startState.value().eventTime.plusSeconds(120 * 60).toEpochMilli());
+                } else {
+                    //set timer 2 hours
+                    context.timerService().registerEventTimeTimer(startState.value().eventTime.plusSeconds(120 * 60).toEpochMilli());
+                }
+            } else {
+                endState.update(ride);
+                if (startState != null && startState.value() != null) {
+                    duration = (endState.value().getEventTimeMillis() - startState.value().getEventTimeMillis());
+                    context.timerService().deleteEventTimeTimer(startState.value().eventTime.plusSeconds(120 * 60).toEpochMilli());
+                }
+            }
+
+            if (duration != null && duration > (2 * 60 * 60 * 1000)) {
+                out.collect(startState.value().rideId);
+                clearstate();
+            } else if (duration != null) {
+                clearstate();
+                context.timerService().deleteEventTimeTimer(2* 60 *60 * 1000);
+            }
+        }
+
+        private void clearstate() {
+            startState.clear();
+            endState.clear();
+        }
 
         @Override
         public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out)
-                throws Exception {}
+                throws Exception {
+            out.collect(startState.value().rideId);
+            clearstate();
+        }
     }
 }
